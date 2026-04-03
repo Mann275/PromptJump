@@ -74,7 +74,7 @@ PromptJump operates with complete privacy:
 
 ## 💡 Support
 
-- 🐛 [Report Issues](https://github.com/Mann275/ChatGPT__PromptJump/issues/new)
+- 🐛 [Report Issues](https://github.com/Mann275/PromptJump/issues/new)
 
 ---
 

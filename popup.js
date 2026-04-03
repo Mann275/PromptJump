@@ -13,7 +13,7 @@ document.addEventListener("DOMContentLoaded", function () {
     reportBugBtn.addEventListener("click", (e) => {
       e.preventDefault();
       chrome.tabs.create({
-        url: "https://github.com/Mann275/ChatGPT__PromptJump/issues/new",
+        url: "https://github.com/Mann275/PromptJump/issues/new",
       });
       window.close();
     });
