@@ -1,25 +1,30 @@
 {
-  "name": "ChatGPT PromptJump",
-  "version": "2.0",
+  "name": "PromptJump",
+  "version": "3.0",
   "manifest_version": 3,
-  "description": "PromptJump — jump to your prompts in active chat sessions on ChatGPT.",
+  "description": "PromptJump — jump to your prompts in active chat sessions on ChatGPT, Claude.",
   "icons": {
     "16": "icons/logo-16.png",
     "48": "icons/logo-48.png",
     "128": "icons/logo-128.png"
   },
   "permissions": ["activeTab", "scripting", "tabs"],
-  "host_permissions": ["https://chatgpt.com/*"],
+  "host_permissions": ["https://chatgpt.com/*", "https://claude.ai/*"],
   "web_accessible_resources": [
     {
-      "resources": ["chat-manager.js", "xhr-tracker.js", "api-tracker.js"],
-      "matches": ["https://chatgpt.com/*"]
+      "resources": [
+        "chat-manager.js",
+        "xhr-tracker.js",
+        "api-tracker.js",
+        "platform-detector.js"
+      ],
+      "matches": ["https://chatgpt.com/*", "https://claude.ai/*"]
     }
   ],
   "content_scripts": [
     {
-      "matches": ["https://chatgpt.com/*"],
-      "js": ["main-script.js"],
+      "matches": ["https://chatgpt.com/*", "https://claude.ai/*"],
+      "js": ["platform-detector.js", "main-script.js"],
       "run_at": "document_start"
     }
   ],
@@ -29,7 +34,7 @@
       "48": "icons/logo-48.png",
       "128": "icons/logo-128.png"
     },
-    "default_title": "ChatGPT PromptJump",
+    "default_title": "PromptJump",
     "default_popup": "popup.html"
   }
 }

@@ -1,4 +1,4 @@
-// ChatGPT PromptJump popup script
+// ChatGPT & Claude PromptJump popup script
 document.addEventListener("DOMContentLoaded", function () {
   const openPanelBtn = document.getElementById("open-panel");
   const reportBugBtn = document.getElementById("report-bug");
@@ -44,8 +44,10 @@ document.addEventListener("DOMContentLoaded", function () {
       });
       if (!tab) return;
 
-      // Check if tab is on supported site
-      const isSupportedSite = tab.url && tab.url.includes("chatgpt.com");
+      // Check if tab is on a supported site
+      const isSupportedSite =
+        tab.url &&
+        (tab.url.includes("chatgpt.com") || tab.url.includes("claude.ai"));
 
       if (!isSupportedSite) {
         // Open ChatGPT if not on supported site

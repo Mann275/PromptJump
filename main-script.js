@@ -1,12 +1,20 @@
 function attachTracker() {
   const configScript = document.createElement("script");
   configScript.src = chrome.runtime.getURL("chat-manager.js");
+  configScript.onerror = function () {
+    console.warn(
+      "PromptJump: chat-manager injection failed, using DOM fallback mode",
+    );
+  };
   configScript.onload = function () {
     this.remove();
 
     // Load XHR Tracker
     const xhrScript = document.createElement("script");
     xhrScript.src = chrome.runtime.getURL("xhr-tracker.js");
+    xhrScript.onerror = function () {
+      console.warn("PromptJump: xhr-tracker injection failed");
+    };
     xhrScript.onload = function () {
       this.remove();
     };
@@ -15,6 +23,9 @@ function attachTracker() {
     // Load API Tracker
     const fetchScript = document.createElement("script");
     fetchScript.src = chrome.runtime.getURL("api-tracker.js");
+    fetchScript.onerror = function () {
+      console.warn("PromptJump: api-tracker injection failed");
+    };
     fetchScript.onload = function () {
       this.remove();
     };
@@ -100,6 +111,7 @@ function togglePromptPanel() {
       void promptPanel.offsetHeight;
       promptPanel.style.opacity = "1";
       toggleButton.style.display = "none";
+      refreshPromptPanelContent(true);
     }
   }
 }
@@ -234,8 +246,7 @@ function createPromptPanel() {
   contentWrapper.style.borderRadius = "6px";
   contentWrapper.style.padding = "6px";
   contentWrapper.style.margin = "0";
-  contentWrapper.innerHTML =
-    '<div style="margin: 0 0 4px 0; color: #94a3b8; font-size: 13px; text-align: center; padding: 8px 0;">Jump to saved prompts for this chat</div><div style="margin: 0 0 8px 0; color: #fbbf24; font-size: 11px; text-align: center; padding: 4px 8px; background: rgba(251, 191, 36, 0.1); border: 1px solid rgba(251, 191, 36, 0.3); border-radius: 4px;">⚠️ Prompts not showing? Try reloading the Page</div>';
+  contentWrapper.innerHTML = "";
 
   // Panel styling with more transparency and blur
   div.style.position = "fixed";
@@ -265,23 +276,6 @@ function createPromptPanel() {
   div.appendChild(headerContainer);
   div.appendChild(searchContainer);
   div.appendChild(contentWrapper);
-
-  // Add footer content directly to content wrapper
-  const footerDiv = document.createElement("div");
-  footerDiv.style.textAlign = "center";
-  footerDiv.style.borderTop = "1px solid rgba(51, 65, 85, 0.4)";
-  footerDiv.style.paddingTop = "6px";
-  footerDiv.style.marginTop = "6px";
-  footerDiv.style.fontSize = "10px";
-  footerDiv.style.margin = "6px 0 0 0";
-  footerDiv.style.padding = "6px 0 0 0";
-
-  const madeWithSpan = document.createElement("span");
-  madeWithSpan.innerHTML = "Made with ❤️";
-  madeWithSpan.style.color = "rgba(148, 163, 184, 0.7)";
-
-  footerDiv.appendChild(madeWithSpan);
-  contentWrapper.appendChild(footerDiv);
 
   // Check if document.body exists before appending
   if (document.body) {
@@ -370,6 +364,592 @@ function makeDraggable(element, dragHandle) {
   }
 }
 
+const PROMPTJUMP_STATE = {
+  messageMap: new Map(),
+  observer: null,
+  isRendering: false,
+  lastRenderFingerprint: "",
+  lastLoggedCount: -1,
+};
+
+function getActivePlatform() {
+  if (window.location.hostname.includes("claude.ai")) {
+    return "claude";
+  }
+  if (window.location.hostname.includes("chatgpt.com")) {
+    return "chatgpt";
+  }
+  return "unknown";
+}
+
+function isConversationPage() {
+  const platform = getActivePlatform();
+  const path = window.location.pathname || "";
+
+  if (platform === "claude") {
+    // Claude conversations are under /chat/<id>. /new should be treated as no-chat.
+    return /^\/chat\//.test(path);
+  }
+
+  if (platform === "chatgpt") {
+    // ChatGPT conversation pages commonly include /c/<id>.
+    if (/^\/c\//.test(path)) {
+      return true;
+    }
+
+    // Fallback: if a user message node already exists, we are in a conversation view.
+    return Boolean(
+      document.querySelector(
+        "[data-message-author-role='user'], [data-testid*='user-message']",
+      ),
+    );
+  }
+
+  return false;
+}
+
+function normalizeMessageText(text) {
+  return (text || "").replace(/\s+/g, " ").trim();
+}
+
+function isInsidePromptJumpUI(element) {
+  if (!element || !element.closest) {
+    return false;
+  }
+
+  return Boolean(
+    element.closest(".promptjump-panel") ||
+    element.closest(".promptjump-toggle-btn"),
+  );
+}
+
+function getConversationRoot() {
+  return (
+    document.querySelector("main") ||
+    document.querySelector("[data-testid='chat-content']") ||
+    document.querySelector("[class*='conversation']") ||
+    document.body
+  );
+}
+
+function hasImageAttachment(element) {
+  if (!element || isInsidePromptJumpUI(element)) {
+    return false;
+  }
+
+  return Boolean(
+    element.querySelector("img") ||
+    element.querySelector("[data-testid*='image']") ||
+    element.querySelector("[data-testid*='attachment']") ||
+    element.querySelector("[class*='image']") ||
+    element.querySelector("[class*='attachment']"),
+  );
+}
+
+function hasMeaningfulText(text) {
+  if (!text) {
+    return false;
+  }
+
+  // Support all languages, not just ASCII, when deciding whether prompt text exists.
+  return /[\p{L}\p{N}]/u.test(text);
+}
+
+function buildPromptPreview(text, hasImage) {
+  const normalizedText = normalizeMessageText(text);
+  const meaningful = hasMeaningfulText(normalizedText);
+
+  if (hasImage && meaningful) {
+    return "Mixed content (Image + Text)";
+  }
+
+  if (hasImage) {
+    return "Image uploaded";
+  }
+
+  if (meaningful) {
+    return normalizedText;
+  }
+
+  return "";
+}
+
+function isResponseInProgress() {
+  const controls = document.querySelectorAll("button, [role='button']");
+  for (const control of controls) {
+    if (isInsidePromptJumpUI(control)) {
+      continue;
+    }
+
+    const controlLabel = `${
+      control.getAttribute("aria-label") || ""
+    } ${control.getAttribute("title") || ""} ${
+      control.textContent || ""
+    }`.toLowerCase();
+
+    if (
+      controlLabel.includes("stop generating") ||
+      controlLabel.includes("stop response") ||
+      controlLabel.includes("stop output") ||
+      controlLabel.includes("cancel response")
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function isUiNoise(text) {
+  const lower = text.toLowerCase();
+  const blockedPhrases = [
+    "new chat",
+    "projects",
+    "artifacts",
+    "customize",
+    "search",
+    "share",
+    "retry",
+    "copy",
+    "edit",
+    "reply...",
+    "sonnet",
+    "made with",
+    "prompts not showing",
+    "jump to saved prompts",
+    "search prompts",
+    "prompts",
+    "free plan upgrade",
+    "upgrade",
+    "welcome",
+    "type / for skills",
+  ];
+  return blockedPhrases.some(
+    (phrase) => lower === phrase || lower.includes(phrase),
+  );
+}
+
+function extractTextFromElement(element) {
+  if (!element || isInsidePromptJumpUI(element)) {
+    return "";
+  }
+
+  const richText = element.querySelector(
+    "p, .whitespace-pre-wrap, .markdown, [class*='prose']",
+  );
+  if (richText && richText.textContent) {
+    return normalizeMessageText(richText.textContent);
+  }
+
+  return normalizeMessageText(element.innerText || element.textContent || "");
+}
+
+function extractChatGPTMessages() {
+  const root = getConversationRoot();
+  const userNodes = root.querySelectorAll(
+    "[data-message-author-role='user'], [data-testid*='user-message']",
+  );
+
+  const messages = [];
+
+  userNodes.forEach((node, index) => {
+    if (isInsidePromptJumpUI(node)) {
+      return;
+    }
+
+    const rawText = extractTextFromElement(node);
+    const hasImage = hasImageAttachment(node);
+    const previewText = buildPromptPreview(rawText, hasImage);
+
+    if (!previewText || isUiNoise(previewText)) {
+      return;
+    }
+
+    const id = node.getAttribute("data-message-id") || `chatgpt-user-${index}`;
+    messages.push({
+      id: `${id}-${index}`,
+      preview:
+        previewText.length > 140
+          ? `${previewText.slice(0, 140)}...`
+          : previewText,
+      element: node,
+      hasImage,
+    });
+  });
+
+  return messages;
+}
+
+function isLikelyClaudeUserNode(node) {
+  if (!node || isInsidePromptJumpUI(node)) {
+    return false;
+  }
+
+  const testId = (node.getAttribute("data-testid") || "").toLowerCase();
+  const className = (node.className || "").toString().toLowerCase();
+  const ariaLabel = (node.getAttribute("aria-label") || "").toLowerCase();
+  const hints = `${testId} ${className} ${ariaLabel}`;
+
+  if (
+    hints.includes("user") ||
+    hints.includes("human") ||
+    hints.includes("prompt")
+  ) {
+    return true;
+  }
+
+  const rect = node.getBoundingClientRect();
+  if (rect.width === 0 || rect.height === 0) {
+    return false;
+  }
+
+  // Claude user bubbles are usually right-aligned and compact.
+  return (
+    rect.left > window.innerWidth * 0.33 && rect.width < window.innerWidth * 0.8
+  );
+}
+
+function extractClaudeMessages() {
+  const root = getConversationRoot();
+  const selectors = [
+    "[data-testid*='user-message']",
+    "[data-testid*='message']",
+    "article",
+    "[role='article']",
+    "[class*='message']",
+    "[class*='prose']",
+  ];
+
+  const candidates = [];
+  const seenNodes = new Set();
+
+  selectors.forEach((selector) => {
+    root.querySelectorAll(selector).forEach((node) => {
+      if (!seenNodes.has(node) && !isInsidePromptJumpUI(node)) {
+        seenNodes.add(node);
+        candidates.push(node);
+      }
+    });
+  });
+
+  const messages = [];
+
+  candidates.forEach((node, index) => {
+    if (!isLikelyClaudeUserNode(node)) {
+      return;
+    }
+
+    const rawText = extractTextFromElement(node);
+    const hasImage = hasImageAttachment(node);
+    const previewText = buildPromptPreview(rawText, hasImage);
+
+    if (!previewText || isUiNoise(previewText)) {
+      return;
+    }
+
+    const id =
+      node.getAttribute("data-message-id") || node.id || `claude-user-${index}`;
+    messages.push({
+      id: `${id}-${index}`,
+      preview:
+        previewText.length > 140
+          ? `${previewText.slice(0, 140)}...`
+          : previewText,
+      element: node,
+      hasImage,
+    });
+  });
+
+  // Fallback: detect right-aligned bubble-like blocks if selectors fail.
+  if (messages.length === 0) {
+    const allDivs = root.querySelectorAll("div");
+    const seenFallbackText = new Set();
+    const maxScan = Math.min(allDivs.length, 2200);
+
+    for (let i = 0; i < maxScan; i++) {
+      const node = allDivs[i];
+      if (!node || node.children.length > 10) {
+        continue;
+      }
+
+      if (isInsidePromptJumpUI(node)) {
+        continue;
+      }
+
+      const rect = node.getBoundingClientRect();
+      if (
+        rect.width < 80 ||
+        rect.height < 20 ||
+        rect.width > window.innerWidth * 0.9 ||
+        rect.left <= window.innerWidth * 0.4
+      ) {
+        continue;
+      }
+
+      const style = window.getComputedStyle(node);
+      const hasBubbleBackground =
+        style.backgroundColor &&
+        style.backgroundColor !== "rgba(0, 0, 0, 0)" &&
+        style.backgroundColor !== "transparent";
+
+      if (!hasBubbleBackground) {
+        continue;
+      }
+
+      const rawText = extractTextFromElement(node);
+      const hasImage = hasImageAttachment(node);
+      const previewText = buildPromptPreview(rawText, hasImage);
+
+      if (!previewText || previewText.length > 300 || isUiNoise(previewText)) {
+        continue;
+      }
+
+      const dedupeKey = previewText.toLowerCase();
+      if (seenFallbackText.has(dedupeKey)) {
+        continue;
+      }
+      seenFallbackText.add(dedupeKey);
+
+      messages.push({
+        id: `claude-fallback-${i}`,
+        preview:
+          previewText.length > 140
+            ? `${previewText.slice(0, 140)}...`
+            : previewText,
+        element: node,
+        hasImage,
+      });
+    }
+  }
+
+  return messages;
+}
+
+function getConversationMessages() {
+  if (!isConversationPage()) {
+    return [];
+  }
+
+  const platform = getActivePlatform();
+  let messages = [];
+
+  if (platform === "claude") {
+    messages = extractClaudeMessages();
+  }
+  if (platform === "chatgpt") {
+    messages = extractChatGPTMessages();
+  }
+
+  // Only list completed prompts. If assistant is still generating, latest user prompt stays hidden.
+  if (messages.length > 0 && isResponseInProgress()) {
+    return messages.slice(0, -1);
+  }
+
+  return messages;
+}
+
+function buildMessageFingerprint(messages) {
+  return messages
+    .map((message) => message.preview.toLowerCase())
+    .sort()
+    .join("||");
+}
+
+function jumpToTrackedMessage(messageId) {
+  const target = PROMPTJUMP_STATE.messageMap.get(messageId);
+  if (!target || !target.element) {
+    return;
+  }
+
+  const targetElement = target.element;
+  targetElement.scrollIntoView({ behavior: "smooth", block: "center" });
+
+  const originalBg = targetElement.style.backgroundColor;
+  const originalBorder = targetElement.style.border;
+  const originalBoxShadow = targetElement.style.boxShadow;
+
+  targetElement.style.transition = "all 0.3s ease";
+  targetElement.style.backgroundColor = "rgba(59, 130, 246, 0.15)";
+  targetElement.style.border = "2px solid rgba(59, 130, 246, 0.5)";
+  targetElement.style.boxShadow = "0 0 20px rgba(59, 130, 246, 0.3)";
+  targetElement.style.borderRadius = "8px";
+
+  setTimeout(() => {
+    targetElement.style.backgroundColor = originalBg;
+    targetElement.style.border = originalBorder;
+    targetElement.style.boxShadow = originalBoxShadow;
+  }, 1200);
+}
+
+function refreshPromptPanelContent(force = false) {
+  if (PROMPTJUMP_STATE.isRendering) {
+    return;
+  }
+
+  const promptPanel = document.querySelector(".promptjump-panel");
+  if (!promptPanel) {
+    return;
+  }
+
+  const contentWrapper = promptPanel.querySelector(".content-wrapper");
+  if (!contentWrapper) {
+    return;
+  }
+
+  const messages = getConversationMessages();
+  const fingerprint = buildMessageFingerprint(messages);
+  if (!force && fingerprint === PROMPTJUMP_STATE.lastRenderFingerprint) {
+    return;
+  }
+
+  PROMPTJUMP_STATE.lastRenderFingerprint = fingerprint;
+
+  if (messages.length !== PROMPTJUMP_STATE.lastLoggedCount) {
+    console.log("[PromptJump] DOM mode extracted messages:", messages.length);
+    PROMPTJUMP_STATE.lastLoggedCount = messages.length;
+  }
+
+  PROMPTJUMP_STATE.isRendering = true;
+  PROMPTJUMP_STATE.messageMap.clear();
+
+  try {
+    contentWrapper.innerHTML = "";
+
+    if (messages.length === 0) {
+      const helperTitleDiv = document.createElement("div");
+      helperTitleDiv.style.margin = "0 0 4px 0";
+      helperTitleDiv.style.color = "#94a3b8";
+      helperTitleDiv.style.fontSize = "13px";
+      helperTitleDiv.style.textAlign = "center";
+      helperTitleDiv.style.padding = "8px 0";
+      helperTitleDiv.textContent = "Jump to saved prompts for this chat";
+      contentWrapper.appendChild(helperTitleDiv);
+
+      const helperWarnDiv = document.createElement("div");
+      helperWarnDiv.style.margin = "0 0 8px 0";
+      helperWarnDiv.style.color = "#fbbf24";
+      helperWarnDiv.style.fontSize = "11px";
+      helperWarnDiv.style.textAlign = "center";
+      helperWarnDiv.style.padding = "4px 8px";
+      helperWarnDiv.style.background = "rgba(251, 191, 36, 0.1)";
+      helperWarnDiv.style.border = "1px solid rgba(251, 191, 36, 0.3)";
+      helperWarnDiv.style.borderRadius = "4px";
+      helperWarnDiv.textContent =
+        "⚠️ Prompts not showing? Try reloading the Page";
+      contentWrapper.appendChild(helperWarnDiv);
+    } else {
+      messages
+        .slice()
+        .reverse()
+        .forEach((message, index) => {
+          const messageId = `${message.id}-${index}`;
+          PROMPTJUMP_STATE.messageMap.set(messageId, message);
+
+          const messageDiv = document.createElement("div");
+          messageDiv.classList.add("prompt-message-item");
+          messageDiv.style.marginBottom = "6px";
+          messageDiv.style.padding = "0";
+
+          const msgButton = document.createElement("button");
+          const messageIcon = message.hasImage ? "🖼️" : "💬";
+          msgButton.innerHTML = `${messageIcon} ${message.preview}`;
+          msgButton.style.cursor = "pointer";
+          msgButton.style.padding = "8px 12px";
+          msgButton.style.textAlign = "left";
+          msgButton.style.width = "100%";
+          msgButton.style.borderRadius = "6px";
+          msgButton.style.fontSize = "13px";
+          msgButton.style.display = "-webkit-box";
+          msgButton.style.webkitLineClamp = "2";
+          msgButton.style.webkitBoxOrient = "vertical";
+          msgButton.style.overflow = "hidden";
+          msgButton.style.textOverflow = "ellipsis";
+          msgButton.style.background = "rgba(30, 41, 59, 0.7)";
+          msgButton.style.color = "#f1f5f9";
+          msgButton.style.border = "1px solid rgba(51, 65, 85, 0.5)";
+          msgButton.style.marginBottom = "1px";
+          msgButton.style.transition = "all 0.2s ease";
+          msgButton.onmouseover = () => {
+            msgButton.style.backgroundColor = "rgba(51, 65, 85, 0.8)";
+            msgButton.style.borderColor = "rgba(96, 165, 250, 0.5)";
+            msgButton.style.transform = "translateY(-1px)";
+          };
+          msgButton.onmouseout = () => {
+            msgButton.style.backgroundColor = "rgba(30, 41, 59, 0.7)";
+            msgButton.style.borderColor = "rgba(138, 180, 255, 0.15)";
+            msgButton.style.transform = "translateY(0)";
+          };
+          msgButton.onclick = () => jumpToTrackedMessage(messageId);
+
+          messageDiv.appendChild(msgButton);
+          contentWrapper.appendChild(messageDiv);
+        });
+    }
+
+    if (messages.length === 0) {
+      const footerDiv = document.createElement("div");
+      footerDiv.style.textAlign = "center";
+      footerDiv.style.borderTop = "1px solid rgba(51, 65, 85, 0.4)";
+      footerDiv.style.paddingTop = "6px";
+      footerDiv.style.marginTop = "6px";
+      footerDiv.style.fontSize = "10px";
+      const madeWithSpan = document.createElement("span");
+      madeWithSpan.innerHTML = "Made with ❤️";
+      madeWithSpan.style.color = "rgba(148, 163, 184, 0.7)";
+      footerDiv.appendChild(madeWithSpan);
+      contentWrapper.appendChild(footerDiv);
+    }
+  } finally {
+    PROMPTJUMP_STATE.isRendering = false;
+  }
+}
+
+function setupConversationObserver() {
+  if (PROMPTJUMP_STATE.observer) {
+    return;
+  }
+
+  const root = getConversationRoot();
+  if (!root) {
+    return;
+  }
+
+  let refreshTimeout;
+  PROMPTJUMP_STATE.observer = new MutationObserver((mutations) => {
+    const hasRelevantMutation = mutations.some((mutation) => {
+      const targetNode =
+        mutation.target?.nodeType === Node.ELEMENT_NODE
+          ? mutation.target
+          : mutation.target?.parentElement;
+
+      if (!targetNode) {
+        return false;
+      }
+
+      return !isInsidePromptJumpUI(targetNode);
+    });
+
+    if (!hasRelevantMutation) {
+      return;
+    }
+
+    clearTimeout(refreshTimeout);
+    refreshTimeout = setTimeout(() => {
+      const panel = document.querySelector(".promptjump-panel");
+      if (!panel || panel.style.display === "none") {
+        return;
+      }
+      refreshPromptPanelContent(false);
+    }, 300);
+  });
+
+  PROMPTJUMP_STATE.observer.observe(root, {
+    childList: true,
+    subtree: true,
+    characterData: true,
+  });
+}
+
 // Add CSS animations for smooth transitions
 function injectStyles() {
   if (document.head && !document.getElementById("promptjump-styles")) {
@@ -446,25 +1026,30 @@ window.addEventListener("promptjump_open_from_popup", () => {
 
   if (promptPanel) {
     promptPanel.style.display = "block";
+    promptPanel.style.visibility = "visible";
+    promptPanel.style.opacity = "1";
     if (toggleButton) toggleButton.style.display = "none";
+    refreshPromptPanelContent(true);
+    setupConversationObserver();
   } else {
     // Create panel if it doesn't exist
     createPromptPanel();
     createNavButton();
     setTimeout(() => {
       const newPanel = document.querySelector(".promptjump-panel");
-      if (newPanel) newPanel.style.display = "block";
+      if (newPanel) {
+        newPanel.style.display = "block";
+        newPanel.style.visibility = "visible";
+        newPanel.style.opacity = "1";
+      }
+      refreshPromptPanelContent(true);
+      setupConversationObserver();
     }, 100);
   }
 });
 
 window.addEventListener("promptjump_refresh", () => {
-  if (
-    window.__PROMPTJUMP_CORE_CONFIG &&
-    window.__PROMPTJUMP_CORE_CONFIG.updatePromptPanel
-  ) {
-    window.__PROMPTJUMP_CORE_CONFIG.updatePromptPanel(0);
-  }
+  refreshPromptPanelContent(true);
 });
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -483,6 +1068,8 @@ document.addEventListener("DOMContentLoaded", () => {
 
       createPromptPanel();
       createNavButton();
+      refreshPromptPanelContent(true);
+      setupConversationObserver();
     } catch (error) {
       console.error("PromptJump: Error creating UI elements:", error);
     }
